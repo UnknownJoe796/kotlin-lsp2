@@ -1,14 +1,14 @@
-// by Claude
+// by Claude - Migrated to use AnalysisSession
 package org.kotlinlsp.server
 
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.messages.Either
 import org.eclipse.lsp4j.services.TextDocumentService
+import org.kotlinlsp.analysis.AnalysisSession
 import org.kotlinlsp.analysis.CompletionProvider
 import org.kotlinlsp.analysis.DiagnosticsProvider
 import org.kotlinlsp.analysis.DefinitionProvider
 import org.kotlinlsp.analysis.HoverProvider
-import org.kotlinlsp.project.SessionManager
 import org.slf4j.LoggerFactory
 import java.util.concurrent.CompletableFuture
 
@@ -17,17 +17,17 @@ import java.util.concurrent.CompletableFuture
  */
 class KmpTextDocumentService(
     private val server: KmpLanguageServer,
-    private val sessionManager: SessionManager
+    private val analysisSession: AnalysisSession
 ) : TextDocumentService {
 
     private val logger = LoggerFactory.getLogger(KmpTextDocumentService::class.java)
 
-    private val completionProvider = CompletionProvider(sessionManager)
-    private val hoverProvider = HoverProvider(sessionManager)
-    private val definitionProvider = DefinitionProvider(sessionManager)
-    private val diagnosticsProvider = DiagnosticsProvider(sessionManager)
+    private val completionProvider = CompletionProvider(analysisSession)
+    private val hoverProvider = HoverProvider(analysisSession)
+    private val definitionProvider = DefinitionProvider(analysisSession)
+    private val diagnosticsProvider = DiagnosticsProvider(analysisSession)
 
-    // Track open documents and their content
+    // Track open documents
     private val openDocuments = mutableMapOf<String, String>()
 
     override fun didOpen(params: DidOpenTextDocumentParams) {
@@ -36,7 +36,7 @@ class KmpTextDocumentService(
         logger.info("Document opened: $uri")
 
         openDocuments[uri] = text
-        sessionManager.updateDocument(uri, text)
+        analysisSession.updateDocument(uri, text)
 
         // Trigger diagnostics
         publishDiagnostics(uri)
@@ -49,7 +49,7 @@ class KmpTextDocumentService(
         logger.debug("Document changed: $uri")
 
         openDocuments[uri] = text
-        sessionManager.updateDocument(uri, text)
+        analysisSession.updateDocument(uri, text)
 
         // Trigger diagnostics on change
         publishDiagnostics(uri)
@@ -60,7 +60,7 @@ class KmpTextDocumentService(
         logger.info("Document closed: $uri")
 
         openDocuments.remove(uri)
-        sessionManager.closeDocument(uri)
+        analysisSession.closeDocument(uri)
 
         // Clear diagnostics for closed document
         server.publishDiagnostics(uri, emptyList())

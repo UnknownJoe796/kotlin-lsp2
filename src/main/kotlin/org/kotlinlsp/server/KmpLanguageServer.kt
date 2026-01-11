@@ -1,10 +1,11 @@
-// by Claude
+// by Claude - Migrated to use AnalysisSession
 package org.kotlinlsp.server
 
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.messages.Either
 import org.eclipse.lsp4j.services.*
-import org.kotlinlsp.project.SessionManager
+import org.kotlinlsp.analysis.AnalysisSession
+import org.kotlinlsp.project.GradleImporter
 import org.slf4j.LoggerFactory
 import java.util.concurrent.CompletableFuture
 import kotlin.system.exitProcess
@@ -18,18 +19,18 @@ class KmpLanguageServer : LanguageServer, LanguageClientAware {
     private val logger = LoggerFactory.getLogger(KmpLanguageServer::class.java)
 
     private lateinit var client: LanguageClient
-    private val sessionManager = SessionManager()
-    private val textDocumentService = KmpTextDocumentService(this, sessionManager)
-    private val workspaceService = KmpWorkspaceService(this, sessionManager)
+    private val analysisSession = AnalysisSession()
+    private val textDocumentService = KmpTextDocumentService(this, analysisSession)
+    private val workspaceService = KmpWorkspaceService(this, analysisSession)
 
     override fun initialize(params: InitializeParams): CompletableFuture<InitializeResult> {
         logger.info("Initializing KMP Language Server...")
         logger.info("Client info: ${params.clientInfo?.name} ${params.clientInfo?.version}")
         logger.info("Root URI: ${params.rootUri}")
 
-        // Initialize the session manager with workspace root
+        // Initialize the analysis session with workspace root
         params.rootUri?.let { uri ->
-            sessionManager.initializeWorkspace(uri)
+            initializeWorkspace(uri)
         }
 
         val capabilities = ServerCapabilities().apply {
@@ -58,13 +59,30 @@ class KmpLanguageServer : LanguageServer, LanguageClientAware {
         return CompletableFuture.completedFuture(result)
     }
 
+    private fun initializeWorkspace(rootUri: String) {
+        logger.info("Initializing workspace: $rootUri")
+
+        // Try to import project structure from Gradle
+        val project = try {
+            val importer = GradleImporter()
+            val projectPath = java.net.URI(rootUri).let { java.nio.file.Paths.get(it) }
+            importer.importProject(projectPath)
+        } catch (e: Exception) {
+            logger.warn("Failed to import Gradle project: ${e.message}")
+            null
+        }
+
+        // Initialize Analysis API session
+        analysisSession.initialize(rootUri, project)
+    }
+
     override fun initialized(params: InitializedParams) {
         logger.info("Client initialized, server is ready")
     }
 
     override fun shutdown(): CompletableFuture<Any> {
         logger.info("Shutdown requested")
-        sessionManager.dispose()
+        analysisSession.dispose()
         return CompletableFuture.completedFuture(null)
     }
 

@@ -1,9 +1,9 @@
-// by Claude
+// by Claude - Migrated to use AnalysisSession
 package org.kotlinlsp.server
 
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.services.WorkspaceService
-import org.kotlinlsp.project.SessionManager
+import org.kotlinlsp.analysis.AnalysisSession
 import org.slf4j.LoggerFactory
 
 /**
@@ -11,7 +11,7 @@ import org.slf4j.LoggerFactory
  */
 class KmpWorkspaceService(
     private val server: KmpLanguageServer,
-    private val sessionManager: SessionManager
+    private val analysisSession: AnalysisSession
 ) : WorkspaceService {
 
     private val logger = LoggerFactory.getLogger(KmpWorkspaceService::class.java)
@@ -40,7 +40,6 @@ class KmpWorkspaceService(
         }
 
         // Invalidate session when project files change
-        // TODO: Be smarter about what triggers invalidation
-        sessionManager.invalidateSession()
+        analysisSession.invalidateSession()
     }
 }

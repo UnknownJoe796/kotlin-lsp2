@@ -1,6 +1,6 @@
-// by Claude
+// by Claude - Migrated to Kotlin Analysis API
 plugins {
-    kotlin("jvm") version "2.0.0"
+    kotlin("jvm") version "2.3.0"
     application
 }
 
@@ -24,21 +24,37 @@ repositories {
     maven("https://maven.pkg.jetbrains.space/kotlin/p/kotlin/bootstrap")
 }
 
-val kotlinVersion = "2.0.0"  // Stable version for compiler
+val kotlinVersion = "2.3.0"
 val lsp4jVersion = "0.23.1"
 val intellijVersion = "243.21565.193"  // IntelliJ 2024.3
 
 dependencies {
-    // Kotlin compiler - provides PSI and internal analysis infrastructure
-    // Note: Analysis API standalone artifacts have broken transitive deps in Maven
-    implementation("org.jetbrains.kotlin:kotlin-util-klib:$kotlinVersion")
+    // IntelliJ Platform core (required by Analysis API)
+    implementation("com.jetbrains.intellij.platform:core:$intellijVersion")
+    implementation("com.jetbrains.intellij.platform:core-impl:$intellijVersion")
+    implementation("com.jetbrains.intellij.platform:util:$intellijVersion")
 
-    // Kotlin compiler - non-embeddable version to get full IntelliJ API access
+    // Kotlin compiler
     implementation("org.jetbrains.kotlin:kotlin-compiler:$kotlinVersion")
 
-    // IntelliJ platform core
-    implementation("com.jetbrains.intellij.platform:core:$intellijVersion")
-    implementation("com.jetbrains.intellij.platform:util:$intellijVersion")
+    // Analysis API modules - MUST use isTransitive = false
+    // See ANALYSIS_API_SETUP.md for why this is required
+    listOf(
+        "org.jetbrains.kotlin:analysis-api-standalone-for-ide",
+        "org.jetbrains.kotlin:analysis-api-k2-for-ide",
+        "org.jetbrains.kotlin:analysis-api-for-ide",
+        "org.jetbrains.kotlin:low-level-api-fir-for-ide",
+        "org.jetbrains.kotlin:analysis-api-platform-interface-for-ide",
+        "org.jetbrains.kotlin:symbol-light-classes-for-ide",
+        "org.jetbrains.kotlin:analysis-api-impl-base-for-ide",
+        "org.jetbrains.kotlin:kotlin-compiler-common-for-ide",
+        "org.jetbrains.kotlin:kotlin-compiler-fir-for-ide"
+    ).forEach {
+        implementation("$it:$kotlinVersion") { isTransitive = false }
+    }
+
+    // Caffeine cache (used by Analysis API internally)
+    implementation("com.github.ben-manes.caffeine:caffeine:2.9.3")
 
     // Kotlin stdlib
     implementation("org.jetbrains.kotlin:kotlin-stdlib:$kotlinVersion")

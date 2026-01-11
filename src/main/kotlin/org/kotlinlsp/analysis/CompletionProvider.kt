@@ -1,21 +1,23 @@
-// by Claude
+// by Claude - Migrated to Kotlin Analysis API
 package org.kotlinlsp.analysis
 
 import org.eclipse.lsp4j.CompletionItem
 import org.eclipse.lsp4j.CompletionItemKind
+import org.eclipse.lsp4j.InsertTextFormat
+import org.eclipse.lsp4j.MarkupContent
 import org.eclipse.lsp4j.Position
-import org.jetbrains.kotlin.descriptors.*
+import org.eclipse.lsp4j.jsonrpc.messages.Either
+import org.jetbrains.kotlin.analysis.api.KaSession
+import org.jetbrains.kotlin.analysis.api.symbols.*
+import org.jetbrains.kotlin.analysis.api.types.KaType
+import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.psi.*
-import org.jetbrains.kotlin.resolve.BindingContext
-import org.jetbrains.kotlin.resolve.scopes.HierarchicalScope
-import org.jetbrains.kotlin.resolve.scopes.LexicalScope
-import org.kotlinlsp.project.SessionManager
 import org.slf4j.LoggerFactory
 
 /**
- * Provides code completion suggestions using PSI analysis and BindingContext.
+ * Provides code completion suggestions using Kotlin Analysis API.
  */
-class CompletionProvider(private val sessionManager: SessionManager) {
+class CompletionProvider(private val analysisSession: AnalysisSession) {
 
     private val logger = LoggerFactory.getLogger(CompletionProvider::class.java)
 
@@ -27,56 +29,95 @@ class CompletionProvider(private val sessionManager: SessionManager) {
         // Always add Kotlin keywords
         completions.addAll(KOTLIN_KEYWORDS.map { createKeywordCompletion(it) })
 
-        // Try to get PSI-based completions
-        val ktFile = sessionManager.getKtFile(uri)
+        // Get KtFile and perform Analysis API-based completions
+        val ktFile = analysisSession.getKtFile(uri)
         if (ktFile != null) {
-            completions.addAll(getPsiCompletions(ktFile, position))
-
-            // Try to get completions from BindingContext (includes stdlib)
-            val bindingContext = sessionManager.analyzeFile(uri)
-            if (bindingContext != null) {
-                completions.addAll(getBindingContextCompletions(ktFile, position, bindingContext))
-            }
+            val analysisCompletions = getAnalysisApiCompletions(ktFile, position)
+            completions.addAll(analysisCompletions)
         }
 
         return completions.distinctBy { it.label }
     }
 
-    private fun getPsiCompletions(file: KtFile, position: Position): List<CompletionItem> {
+    /**
+     * Get completions using Analysis API with proper scope-based resolution.
+     * Uses scopeContext to get all visible symbols at the cursor position.
+     */
+    private fun getAnalysisApiCompletions(ktFile: KtFile, position: Position): List<CompletionItem> {
         val completions = mutableListOf<CompletionItem>()
 
-        // Get file-level declarations
-        file.declarations.forEach { declaration ->
-            when (declaration) {
-                is KtNamedFunction -> {
-                    completions.add(createFunctionCompletion(declaration))
+        val offset = positionToOffset(ktFile.text, position)
+        if (offset < 0) return completions
+
+        // Find a KtElement at position for scope context
+        val psiElement = ktFile.findElementAt(offset)
+        val ktElement = psiElement?.let { findContainingKtElement(it) } ?: ktFile
+
+        analysisSession.withAnalysis(ktFile) {
+            try {
+                // Use scopeContext to get all visible symbols at this position
+                // This includes locals, parameters, class members, imports, stdlib, etc.
+                val scopeContext = ktFile.scopeContext(ktElement)
+
+                // Iterate through all scopes (innermost to outermost)
+                for (scopeWithKind in scopeContext.scopes) {
+                    // Get all declarations from this scope
+                    scopeWithKind.scope.declarations.forEach { symbol ->
+                        createCompletionFromSymbol(symbol)?.let { completions.add(it) }
+                    }
                 }
-                is KtProperty -> {
-                    completions.add(createPropertyCompletion(declaration))
+
+                // Note: Implicit receivers (for extension function context) are handled
+                // through the scope tower already. Type scope API is experimental.
+
+            } catch (e: Exception) {
+                logger.warn("Error getting scope-based completions: ${e.message}", e)
+
+                // Fallback: add file-level declarations if scope resolution fails
+                addFileLevelDeclarations(ktFile, completions)
+            }
+        }
+
+        return completions
+    }
+
+    /**
+     * Find the containing KtElement for a PsiElement.
+     */
+    private fun findContainingKtElement(element: com.intellij.psi.PsiElement): KtElement {
+        var current: com.intellij.psi.PsiElement? = element
+        while (current != null) {
+            if (current is KtElement) return current
+            current = current.parent
+        }
+        return element as? KtElement ?: throw IllegalStateException("No KtElement found")
+    }
+
+    /**
+     * Fallback: add file-level declarations when scope context fails.
+     */
+    private fun KaSession.addFileLevelDeclarations(ktFile: KtFile, completions: MutableList<CompletionItem>) {
+        ktFile.declarations.forEach { declaration ->
+            when (declaration) {
+                is KtNamedFunction -> declaration.symbol.let { symbol ->
+                    createCompletionFromSymbol(symbol)?.let { completions.add(it) }
+                }
+                is KtProperty -> declaration.symbol.let { symbol ->
+                    createCompletionFromSymbol(symbol)?.let { completions.add(it) }
                 }
                 is KtClass -> {
-                    completions.add(createClassCompletion(declaration))
-                    // Add members from the class
-                    declaration.declarations.forEach { member ->
-                        when (member) {
-                            is KtNamedFunction -> completions.add(createFunctionCompletion(member))
-                            is KtProperty -> completions.add(createPropertyCompletion(member))
-                        }
+                    declaration.classSymbol?.let { symbol ->
+                        createCompletionFromSymbol(symbol)?.let { completions.add(it) }
                     }
                 }
-                is KtObjectDeclaration -> {
-                    declaration.name?.let { name ->
-                        completions.add(CompletionItem(name).apply {
-                            kind = CompletionItemKind.Module
-                            detail = "object"
-                        })
-                    }
+                is KtObjectDeclaration -> declaration.symbol.let { symbol ->
+                    createCompletionFromSymbol(symbol)?.let { completions.add(it) }
                 }
             }
         }
 
-        // Get imports for types
-        file.importDirectives.forEach { import ->
+        // Add imports
+        ktFile.importDirectives.forEach { import ->
             import.importedFqName?.shortName()?.asString()?.let { name ->
                 completions.add(CompletionItem(name).apply {
                     kind = CompletionItemKind.Reference
@@ -84,129 +125,96 @@ class CompletionProvider(private val sessionManager: SessionManager) {
                 })
             }
         }
-
-        return completions
     }
 
     /**
-     * Get completions from the BindingContext, which includes stdlib and imported symbols.
+     * Create a completion item from a KaSymbol.
      */
-    private fun getBindingContextCompletions(
-        file: KtFile,
-        position: Position,
-        bindingContext: BindingContext
-    ): List<CompletionItem> {
-        val completions = mutableListOf<CompletionItem>()
+    private fun KaSession.createCompletionFromSymbol(symbol: KaSymbol): CompletionItem? {
+        val name = when (symbol) {
+            is KaDeclarationSymbol -> symbol.name?.asString()
+            else -> null
+        } ?: return null
 
-        try {
-            // Get the lexical scope at the position
-            val offset = positionToOffset(file.text, position)
-            val element = file.findElementAt(offset)
-            if (element == null) {
-                logger.debug("No element found at position")
-                return completions
-            }
-
-            // Find the containing scope
-            var current: com.intellij.psi.PsiElement? = element
-            while (current != null && current !is KtElement) {
-                current = current.parent
-            }
-
-            val ktElement = current as? KtElement
-            if (ktElement != null) {
-                val scope = bindingContext[BindingContext.LEXICAL_SCOPE, ktElement]
-                if (scope != null) {
-                    // Collect all descriptors from the scope chain
-                    val descriptors = collectDescriptorsFromScope(scope)
-                    completions.addAll(descriptors.mapNotNull { createDescriptorCompletion(it) })
-                    logger.debug("Found ${descriptors.size} descriptors in scope")
-                }
-            }
-
-        } catch (e: Exception) {
-            logger.warn("Error getting binding context completions: ${e.message}")
-        }
-
-        return completions
-    }
-
-    /**
-     * Collect all descriptors from a scope and its parent scopes.
-     */
-    private fun collectDescriptorsFromScope(scope: LexicalScope): List<DeclarationDescriptor> {
-        val result = mutableListOf<DeclarationDescriptor>()
-        var currentScope: HierarchicalScope? = scope
-
-        while (currentScope != null) {
-            try {
-                result.addAll(currentScope.getContributedDescriptors())
-            } catch (e: Exception) {
-                // Some scopes may not support this operation
-            }
-            currentScope = currentScope.parent
-        }
-
-        return result
-    }
-
-    /**
-     * Create a completion item from a descriptor.
-     */
-    private fun createDescriptorCompletion(descriptor: DeclarationDescriptor): CompletionItem? {
-        val name = descriptor.name.asString()
-        if (name.startsWith("<") || name.isEmpty()) return null  // Skip special names
+        // Skip special names
+        if (name.startsWith("<") || name.isEmpty()) return null
 
         return CompletionItem(name).apply {
-            when (descriptor) {
-                is FunctionDescriptor -> {
+            when (symbol) {
+                is KaFunctionSymbol -> {
                     kind = CompletionItemKind.Function
-                    detail = buildDescriptorFunctionSignature(descriptor)
-                    insertText = buildDescriptorInsertText(descriptor)
+                    detail = buildFunctionSignature(symbol)
+                    insertText = buildFunctionInsertText(symbol)
+                    insertTextFormat = InsertTextFormat.Snippet
                 }
-                is PropertyDescriptor -> {
-                    kind = if (descriptor.isVar) CompletionItemKind.Variable else CompletionItemKind.Constant
-                    detail = descriptor.type.toString()
+                is KaPropertySymbol -> {
+                    kind = if (symbol.isVal) CompletionItemKind.Constant else CompletionItemKind.Variable
+                    detail = renderType(symbol.returnType)
                 }
-                is ClassDescriptor -> {
-                    kind = when {
-                        descriptor.kind == ClassKind.INTERFACE -> CompletionItemKind.Interface
-                        descriptor.kind == ClassKind.ENUM_CLASS -> CompletionItemKind.Enum
-                        descriptor.kind == ClassKind.OBJECT -> CompletionItemKind.Module
+                is KaClassSymbol -> {
+                    kind = when (symbol.classKind) {
+                        KaClassKind.INTERFACE -> CompletionItemKind.Interface
+                        KaClassKind.ENUM_CLASS -> CompletionItemKind.Enum
+                        KaClassKind.OBJECT, KaClassKind.COMPANION_OBJECT -> CompletionItemKind.Module
+                        KaClassKind.ANNOTATION_CLASS -> CompletionItemKind.Interface
                         else -> CompletionItemKind.Class
                     }
-                    detail = descriptor.kind.name.lowercase()
+                    detail = symbol.classKind.name.lowercase().replace("_", " ")
                 }
-                is VariableDescriptor -> {
+                is KaVariableSymbol -> {
                     kind = CompletionItemKind.Variable
-                    detail = descriptor.type.toString()
+                    detail = renderType(symbol.returnType)
+                }
+                is KaTypeAliasSymbol -> {
+                    kind = CompletionItemKind.TypeParameter
+                    detail = "typealias"
                 }
                 else -> {
                     kind = CompletionItemKind.Value
-                    detail = descriptor.javaClass.simpleName
                 }
             }
         }
     }
 
-    private fun buildDescriptorFunctionSignature(function: FunctionDescriptor): String {
+    /**
+     * Build function signature for display.
+     */
+    private fun KaSession.buildFunctionSignature(function: KaFunctionSymbol): String {
         val params = function.valueParameters.joinToString(", ") { param ->
-            "${param.name}: ${param.type}"
+            "${param.name.asString()}: ${renderType(param.returnType)}"
         }
-        val returnType = function.returnType?.toString() ?: "Unit"
+        val returnType = renderType(function.returnType)
         return "($params) -> $returnType"
     }
 
-    private fun buildDescriptorInsertText(function: FunctionDescriptor): String {
-        val name = function.name.asString()
+    /**
+     * Build function insert text with snippet placeholders.
+     */
+    private fun KaSession.buildFunctionInsertText(function: KaFunctionSymbol): String {
+        val name = function.name?.asString() ?: return ""
         val paramCount = function.valueParameters.size
+
         return if (paramCount == 0) {
             "$name()"
         } else {
             val params = function.valueParameters.mapIndexed { i, param ->
-                "\${${i + 1}:${param.name}}"
+                "\${${i + 1}:${param.name.asString()}}"
             }.joinToString(", ")
             "$name($params)"
+        }
+    }
+
+    /**
+     * Render a type to string.
+     */
+    private fun KaSession.renderType(type: KaType): String {
+        return type.toString()
+    }
+
+    private fun createKeywordCompletion(keyword: String): CompletionItem {
+        return CompletionItem(keyword).apply {
+            kind = CompletionItemKind.Keyword
+            detail = "Kotlin keyword"
         }
     }
 
@@ -233,72 +241,6 @@ class CompletionProvider(private val sessionManager: SessionManager) {
         return if (line == position.line) text.length else -1
     }
 
-    private fun createFunctionCompletion(function: KtNamedFunction): CompletionItem {
-        val name = function.name ?: return CompletionItem("<anonymous>")
-
-        return CompletionItem(name).apply {
-            kind = CompletionItemKind.Function
-            detail = buildFunctionSignature(function)
-            insertText = buildFunctionInsertText(function)
-        }
-    }
-
-    private fun buildFunctionSignature(function: KtNamedFunction): String {
-        val params = function.valueParameters.joinToString(", ") { param ->
-            "${param.name}: ${param.typeReference?.text ?: "Any"}"
-        }
-        val returnType = function.typeReference?.text ?: "Unit"
-        return "($params) -> $returnType"
-    }
-
-    private fun buildFunctionInsertText(function: KtNamedFunction): String {
-        val name = function.name ?: return ""
-        val paramCount = function.valueParameters.size
-        return if (paramCount == 0) {
-            "$name()"
-        } else {
-            val params = function.valueParameters.mapIndexed { i, param ->
-                "\${${i + 1}:${param.name}}"
-            }.joinToString(", ")
-            "$name($params)"
-        }
-    }
-
-    private fun createPropertyCompletion(property: KtProperty): CompletionItem {
-        val name = property.name ?: return CompletionItem("<anonymous>")
-
-        return CompletionItem(name).apply {
-            kind = if (property.isVar) CompletionItemKind.Variable else CompletionItemKind.Constant
-            detail = property.typeReference?.text ?: "inferred"
-        }
-    }
-
-    private fun createClassCompletion(ktClass: KtClass): CompletionItem {
-        val name = ktClass.name ?: return CompletionItem("<anonymous>")
-
-        return CompletionItem(name).apply {
-            kind = when {
-                ktClass.isInterface() -> CompletionItemKind.Interface
-                ktClass.isEnum() -> CompletionItemKind.Enum
-                ktClass.isData() -> CompletionItemKind.Struct
-                else -> CompletionItemKind.Class
-            }
-            detail = when {
-                ktClass.isInterface() -> "interface"
-                ktClass.isEnum() -> "enum class"
-                ktClass.isData() -> "data class"
-                else -> "class"
-            }
-        }
-    }
-
-    private fun createKeywordCompletion(keyword: String): CompletionItem {
-        return CompletionItem(keyword).apply {
-            kind = CompletionItemKind.Keyword
-            detail = "Kotlin keyword"
-        }
-    }
-
     companion object {
         private val KOTLIN_KEYWORDS = listOf(
             "fun", "val", "var", "class", "interface", "object",
@@ -312,7 +254,8 @@ class CompletionProvider(private val sessionManager: SessionManager) {
             "null", "true", "false", "this", "super",
             "is", "as", "in", "out", "by", "where",
             "try", "catch", "finally", "throw",
-            "typealias", "typeof"
+            "typealias", "typeof",
+            "expect", "actual"
         )
     }
 }

@@ -1,4 +1,4 @@
-// by Claude
+// by Claude - Migrated to Kotlin Analysis API
 package org.kotlinlsp.analysis
 
 import org.eclipse.lsp4j.Hover
@@ -6,24 +6,25 @@ import org.eclipse.lsp4j.MarkupContent
 import org.eclipse.lsp4j.MarkupKind
 import org.eclipse.lsp4j.Position
 import org.eclipse.lsp4j.jsonrpc.messages.Either
-import org.jetbrains.kotlin.descriptors.*
+import org.jetbrains.kotlin.analysis.api.KaSession
+import org.jetbrains.kotlin.analysis.api.symbols.*
+import org.jetbrains.kotlin.analysis.api.types.KaType
+import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.*
-import org.jetbrains.kotlin.resolve.BindingContext
-import org.jetbrains.kotlin.types.KotlinType
-import org.kotlinlsp.project.SessionManager
+import org.kotlinlsp.project.KmpPlatform
 import org.slf4j.LoggerFactory
 
 /**
- * Provides hover information using PSI analysis and BindingContext for type resolution.
+ * Provides hover information using Kotlin Analysis API.
  */
-class HoverProvider(private val sessionManager: SessionManager) {
+class HoverProvider(private val analysisSession: AnalysisSession) {
 
     private val logger = LoggerFactory.getLogger(HoverProvider::class.java)
 
     fun getHover(uri: String, position: Position): Hover? {
         logger.debug("Hover requested at $uri:${position.line}:${position.character}")
 
-        val ktFile = sessionManager.getKtFile(uri) ?: return null
+        val ktFile = analysisSession.getKtFile(uri) ?: return null
 
         // Convert position to offset
         val offset = positionToOffset(ktFile.text, position)
@@ -32,13 +33,12 @@ class HoverProvider(private val sessionManager: SessionManager) {
         // Find element at position
         val element = ktFile.findElementAt(offset) ?: return null
 
-        // Get the binding context for type resolution
-        val bindingContext = sessionManager.analyzeFile(uri)
-
         // Find the containing declaration or reference
         var current: com.intellij.psi.PsiElement? = element
         while (current != null) {
-            val hover = getHoverForElement(current, bindingContext)
+            val hover = analysisSession.withAnalysis(ktFile) {
+                getHoverForElement(current!!, uri)
+            }
             if (hover != null) return hover
             current = current.parent
         }
@@ -46,15 +46,15 @@ class HoverProvider(private val sessionManager: SessionManager) {
         return null
     }
 
-    private fun getHoverForElement(element: com.intellij.psi.PsiElement, bindingContext: BindingContext?): Hover? {
+    private fun KaSession.getHoverForElement(element: com.intellij.psi.PsiElement, uri: String): Hover? {
         val markdown = when (element) {
-            is KtNamedFunction -> buildFunctionHover(element, bindingContext)
-            is KtProperty -> buildPropertyHover(element, bindingContext)
-            is KtClass -> buildClassHover(element)
+            is KtNamedFunction -> buildFunctionHover(element, uri)
+            is KtProperty -> buildPropertyHover(element)
+            is KtClass -> buildClassHover(element, uri)
             is KtObjectDeclaration -> buildObjectHover(element)
-            is KtParameter -> buildParameterHover(element, bindingContext)
-            is KtTypeReference -> buildTypeReferenceHover(element, bindingContext)
-            is KtReferenceExpression -> buildReferenceHover(element, bindingContext)
+            is KtParameter -> buildParameterHover(element)
+            is KtTypeReference -> buildTypeReferenceHover(element)
+            is KtReferenceExpression -> buildReferenceHover(element)
             else -> null
         } ?: return null
 
@@ -66,9 +66,8 @@ class HoverProvider(private val sessionManager: SessionManager) {
         }
     }
 
-    private fun buildFunctionHover(function: KtNamedFunction, bindingContext: BindingContext?): String {
-        // Try to get resolved descriptor for inferred types
-        val descriptor = bindingContext?.get(BindingContext.FUNCTION, function)
+    private fun KaSession.buildFunctionHover(function: KtNamedFunction, uri: String): String {
+        val symbol = function.symbol
 
         return buildString {
             append("```kotlin\n")
@@ -79,25 +78,15 @@ class HoverProvider(private val sessionManager: SessionManager) {
             // Type parameters
             function.typeParameterList?.text?.let { append(it) }
 
-            // Parameters
+            // Parameters with resolved types
             append("(")
-            append(function.valueParameters.mapIndexed { index, param ->
-                buildString {
-                    param.modifierList?.text?.let { append("$it ") }
-                    val paramType = descriptor?.valueParameters?.getOrNull(index)?.type?.toString()
-                        ?: param.typeReference?.text
-                        ?: "Any"
-                    append("${param.name}: $paramType")
-                    param.defaultValue?.let { append(" = ${it.text}") }
-                }
-            }.joinToString(", "))
+            append(symbol.valueParameters.joinToString(", ") { param ->
+                "${param.name.asString()}: ${param.returnType}"
+            })
             append(")")
 
-            // Return type - use inferred type if explicit type not provided
-            val returnType = function.typeReference?.text
-                ?: descriptor?.returnType?.toString()
-                ?: "Unit"
-            append(": $returnType")
+            // Return type
+            append(": ${symbol.returnType}")
             append("\n```")
 
             // KDoc if available
@@ -105,24 +94,23 @@ class HoverProvider(private val sessionManager: SessionManager) {
                 append("\n\n---\n")
                 append(formatKDoc(doc))
             }
+
+            // Add expect/actual info
+            function.name?.let { name ->
+                appendExpectActualInfo(this, function, name, uri)
+            }
         }
     }
 
-    private fun buildPropertyHover(property: KtProperty, bindingContext: BindingContext?): String {
-        // Try to get resolved descriptor for inferred types
-        val descriptor = bindingContext?.get(BindingContext.VARIABLE, property)
+    private fun KaSession.buildPropertyHover(property: KtProperty): String {
+        val symbol = property.symbol
 
         return buildString {
             append("```kotlin\n")
             property.modifierList?.text?.let { append("$it ") }
             append(if (property.isVar) "var " else "val ")
             property.name?.let { append(it) }
-
-            // Use inferred type if explicit type not provided
-            val type = property.typeReference?.text
-                ?: descriptor?.type?.toString()
-                ?: "(inferred)"
-            append(": $type")
+            append(": ${symbol.returnType}")
             append("\n```")
 
             property.docComment?.text?.let { doc ->
@@ -132,7 +120,9 @@ class HoverProvider(private val sessionManager: SessionManager) {
         }
     }
 
-    private fun buildClassHover(ktClass: KtClass): String {
+    private fun KaSession.buildClassHover(ktClass: KtClass, uri: String): String {
+        val symbol = ktClass.classSymbol
+
         return buildString {
             append("```kotlin\n")
             ktClass.modifierList?.text?.let { append("$it ") }
@@ -171,10 +161,15 @@ class HoverProvider(private val sessionManager: SessionManager) {
                 append("\n\n---\n")
                 append(formatKDoc(doc))
             }
+
+            // Add expect/actual info
+            ktClass.name?.let { name ->
+                appendExpectActualInfo(this, ktClass, name, uri)
+            }
         }
     }
 
-    private fun buildObjectHover(obj: KtObjectDeclaration): String {
+    private fun KaSession.buildObjectHover(obj: KtObjectDeclaration): String {
         return buildString {
             append("```kotlin\n")
             obj.modifierList?.text?.let { append("$it ") }
@@ -189,70 +184,108 @@ class HoverProvider(private val sessionManager: SessionManager) {
         }
     }
 
-    private fun buildParameterHover(param: KtParameter, bindingContext: BindingContext?): String {
-        val descriptor = bindingContext?.get(BindingContext.VALUE_PARAMETER, param)
-
+    private fun KaSession.buildParameterHover(param: KtParameter): String {
         return buildString {
             append("```kotlin\n")
             param.valOrVarKeyword?.text?.let { append("$it ") }
-            val type = param.typeReference?.text
-                ?: descriptor?.type?.toString()
-                ?: "Any"
-            append("${param.name}: $type")
+            append("${param.name}: ${param.typeReference?.text ?: "Any"}")
             param.defaultValue?.let { append(" = ${it.text}") }
             append("\n```")
         }
     }
 
-    private fun buildTypeReferenceHover(typeRef: KtTypeReference, bindingContext: BindingContext?): String {
-        val type = bindingContext?.get(BindingContext.TYPE, typeRef)
-
+    private fun KaSession.buildTypeReferenceHover(typeRef: KtTypeReference): String {
         return buildString {
             append("```kotlin\n")
-            append("type: ${type?.toString() ?: typeRef.text}")
+            append("type: ${typeRef.text}")
             append("\n```")
         }
     }
 
-    private fun buildReferenceHover(ref: KtReferenceExpression, bindingContext: BindingContext?): String {
-        // Try to get the resolved descriptor
-        val target = bindingContext?.get(BindingContext.REFERENCE_TARGET, ref)
-        val expressionType = bindingContext?.getType(ref)
+    private fun KaSession.buildReferenceHover(ref: KtReferenceExpression): String {
+        // Try to resolve the reference using references collection
+        val resolvedPsi = ref.references.mapNotNull { r ->
+            try { r.resolve() } catch (e: Exception) { null }
+        }.firstOrNull()
+
+        // Get symbol from resolved PSI
+        val symbol = when (resolvedPsi) {
+            is KtNamedFunction -> resolvedPsi.symbol
+            is KtProperty -> resolvedPsi.symbol
+            is KtClass -> resolvedPsi.classSymbol
+            is KtParameter -> resolvedPsi.symbol
+            else -> null
+        }
 
         return buildString {
             append("```kotlin\n")
-            when (target) {
-                is FunctionDescriptor -> {
-                    append("fun ${target.name}")
+            when (symbol) {
+                is KaFunctionSymbol -> {
+                    append("fun ${symbol.name}")
                     append("(")
-                    append(target.valueParameters.joinToString(", ") { "${it.name}: ${it.type}" })
-                    append("): ${target.returnType}")
+                    append(symbol.valueParameters.joinToString(", ") {
+                        "${it.name.asString()}: ${it.returnType}"
+                    })
+                    append("): ${symbol.returnType}")
                 }
-                is PropertyDescriptor -> {
-                    append(if (target.isVar) "var " else "val ")
-                    append("${target.name}: ${target.type}")
+                is KaPropertySymbol -> {
+                    append(if (symbol.isVal) "val " else "var ")
+                    append("${symbol.name}: ${symbol.returnType}")
                 }
-                is VariableDescriptor -> {
-                    append("val ${target.name}: ${target.type}")
+                is KaVariableSymbol -> {
+                    append("val ${symbol.name}: ${symbol.returnType}")
                 }
-                is ClassDescriptor -> {
-                    append("${target.kind.name.lowercase()} ${target.name}")
+                is KaClassSymbol -> {
+                    append("${symbol.classKind.name.lowercase()} ${symbol.name}")
                 }
                 else -> {
                     append(ref.text)
-                    if (expressionType != null) {
-                        append(": $expressionType")
-                    }
                 }
             }
             append("\n```")
 
             // Add containing class info if available
-            target?.containingDeclaration?.let { container ->
-                if (container is ClassDescriptor) {
+            symbol?.containingDeclaration?.let { container ->
+                if (container is KaClassSymbol) {
                     append("\n\n*Declared in: ${container.name}*")
                 }
             }
+        }
+    }
+
+    /**
+     * Append expect/actual information to hover.
+     */
+    private fun appendExpectActualInfo(builder: StringBuilder, element: KtModifierListOwner, name: String, uri: String) {
+        val isExpect = element.hasModifier(KtTokens.EXPECT_KEYWORD)
+        val isActual = element.hasModifier(KtTokens.ACTUAL_KEYWORD)
+
+        if (!isExpect && !isActual) return
+
+        builder.append("\n\n---\n")
+
+        if (isExpect) {
+            builder.append("**expect declaration**\n\n")
+            builder.append("*Platform implementations available*")
+        }
+
+        if (isActual) {
+            builder.append("**actual implementation**\n\n")
+            val platform = analysisSession.getPlatformForUri(uri)
+            builder.append("*Platform: ${formatPlatform(platform)}*")
+        }
+    }
+
+    private fun formatPlatform(platform: KmpPlatform): String {
+        return when (platform) {
+            KmpPlatform.COMMON -> "common"
+            KmpPlatform.JVM -> "JVM"
+            KmpPlatform.JS -> "JS"
+            KmpPlatform.NATIVE_IOS -> "iOS"
+            KmpPlatform.NATIVE_MACOS -> "macOS"
+            KmpPlatform.NATIVE_LINUX -> "Linux"
+            KmpPlatform.NATIVE_WINDOWS -> "Windows"
+            KmpPlatform.NATIVE_OTHER -> "Native"
         }
     }
 
