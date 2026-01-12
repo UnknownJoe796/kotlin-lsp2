@@ -2,9 +2,12 @@
 package org.kotlinlsp.server
 
 import org.eclipse.lsp4j.*
+import org.eclipse.lsp4j.jsonrpc.messages.Either
 import org.eclipse.lsp4j.services.WorkspaceService
 import org.kotlinlsp.analysis.AnalysisSession
+import org.kotlinlsp.analysis.WorkspaceSymbolProvider
 import org.slf4j.LoggerFactory
+import java.util.concurrent.CompletableFuture
 
 /**
  * Handles workspace-level operations: configuration changes, watched files, etc.
@@ -15,6 +18,24 @@ class KmpWorkspaceService(
 ) : WorkspaceService {
 
     private val logger = LoggerFactory.getLogger(KmpWorkspaceService::class.java)
+
+    private val workspaceSymbolProvider = WorkspaceSymbolProvider(analysisSession)
+
+    @Suppress("DEPRECATION")
+    override fun symbol(params: WorkspaceSymbolParams): CompletableFuture<Either<MutableList<out SymbolInformation>, MutableList<out WorkspaceSymbol>>> {
+        return CompletableFuture.supplyAsync {
+            val query = params.query
+            logger.debug("Workspace symbols requested for query: $query")
+
+            try {
+                val symbols = workspaceSymbolProvider.getWorkspaceSymbols(query)
+                Either.forLeft<MutableList<out SymbolInformation>, MutableList<out WorkspaceSymbol>>(symbols.toMutableList())
+            } catch (e: Exception) {
+                logger.error("Workspace symbols failed", e)
+                Either.forLeft<MutableList<out SymbolInformation>, MutableList<out WorkspaceSymbol>>(mutableListOf())
+            }
+        }
+    }
 
     override fun didChangeConfiguration(params: DidChangeConfigurationParams) {
         logger.info("Configuration changed: ${params.settings}")

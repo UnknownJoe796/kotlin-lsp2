@@ -5,6 +5,7 @@ import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.messages.Either
 import org.eclipse.lsp4j.services.*
 import org.kotlinlsp.analysis.AnalysisSession
+import org.kotlinlsp.analysis.SemanticTokensProvider
 import org.kotlinlsp.project.GradleImporter
 import org.slf4j.LoggerFactory
 import java.util.concurrent.CompletableFuture
@@ -48,6 +49,40 @@ class KmpLanguageServer : LanguageServer, LanguageClientAware {
 
             // Go to definition
             definitionProvider = Either.forLeft(true)
+
+            // Find references
+            referencesProvider = Either.forLeft(true)
+
+            // Document symbols (outline)
+            documentSymbolProvider = Either.forLeft(true)
+
+            // Workspace symbols (global search)
+            workspaceSymbolProvider = Either.forLeft(true)
+
+            // Signature help (parameter hints)
+            signatureHelpProvider = SignatureHelpOptions().apply {
+                triggerCharacters = listOf("(", ",")
+                retriggerCharacters = listOf(",")
+            }
+
+            // Code actions (quick fixes)
+            codeActionProvider = Either.forLeft(true)
+
+            // Rename refactoring
+            renameProvider = Either.forRight(RenameOptions().apply {
+                prepareProvider = true
+            })
+
+            // Formatting
+            documentFormattingProvider = Either.forLeft(true)
+            documentRangeFormattingProvider = Either.forLeft(true)
+
+            // Semantic tokens
+            semanticTokensProvider = SemanticTokensWithRegistrationOptions().apply {
+                legend = SemanticTokensProvider.getLegend()
+                full = Either.forLeft(true)
+                range = Either.forLeft(false)
+            }
 
             // Diagnostics are pushed via publishDiagnostics, no pull support needed
         }

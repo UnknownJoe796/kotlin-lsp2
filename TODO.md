@@ -1,10 +1,10 @@
 # Features to Prod
 
-[ ] Find References - Medium      
-[ ] Workspace Symbols - Low         
-[ ] Document Symbols - Low         
-[ ] Signature Help - Medium      
-[ ] Code Actions (Quick Fixes) - Medium      
-[ ] Rename Refactoring - Medium-High
-[ ] Formatting - Low         
-[ ] Semantic Tokens - Medium      
+[x] Find References - Medium
+[x] Workspace Symbols - Low
+[x] Document Symbols - Low
+[x] Signature Help - Medium
+[x] Code Actions (Quick Fixes) - Medium
+[x] Rename Refactoring - Medium-High
+[x] Formatting - Low
+[x] Semantic Tokens - Medium      
