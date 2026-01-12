@@ -4,3 +4,5 @@ plugins {
 }
 
 rootProject.name = "kmp-lsp"
+
+include("gradle-plugin")

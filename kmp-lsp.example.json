@@ -1,0 +1,45 @@
+{
+  "name": "my-kotlin-project",
+  "modules": [
+    {
+      "name": "commonMain",
+      "platform": "common",
+      "sourceRoots": ["src/commonMain/kotlin"],
+      "dependencies": [],
+      "dependsOn": []
+    },
+    {
+      "name": "jvmMain",
+      "platform": "jvm",
+      "sourceRoots": ["src/jvmMain/kotlin"],
+      "dependencies": [
+        "~/.gradle/caches/modules-2/files-2.1/org.jetbrains.kotlin/kotlin-stdlib/2.0.0/*/*.jar"
+      ],
+      "dependsOn": ["commonMain"]
+    },
+    {
+      "name": "iosMain",
+      "platform": "ios",
+      "sourceRoots": ["src/iosMain/kotlin"],
+      "dependencies": [],
+      "dependsOn": ["commonMain"]
+    }
+  ],
+  "dependencies": [
+    "libs/*.jar"
+  ],
+  "exclude": [
+    "**/build/**",
+    "**/.gradle/**",
+    "**/generated/**"
+  ],
+  "settings": {
+    "enableDiagnostics": true,
+    "enableSemanticTokens": true,
+    "diagnosticsDelay": 500,
+    "maxCompletionItems": 100,
+    "autoImport": true,
+    "jdkHome": null,
+    "kotlinStdlib": null
+  }
+}

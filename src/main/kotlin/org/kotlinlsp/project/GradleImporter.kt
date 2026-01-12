@@ -20,18 +20,33 @@ import kotlin.io.path.name
  * - Source sets and their directories
  * - Dependencies (JARs and KLIBs)
  * - Module dependencies (for expect/actual support)
+ *
+ * Priority order:
+ * 1. Explicit kmp-lsp.json configuration (if present)
+ * 2. Gradle Tooling API
+ * 3. Manual directory scanning fallback
  */
 class GradleImporter {
 
     private val logger = LoggerFactory.getLogger(GradleImporter::class.java)
 
     /**
-     * Import a Gradle project from the given root directory.
+     * Import a project from the given root directory.
+     *
+     * Checks for explicit kmp-lsp.json first, then falls back to Gradle detection.
      */
     fun importProject(projectRoot: Path): KmpProject? {
+        // Priority 1: Explicit configuration file
+        val explicitConfig = ProjectConfig.load(projectRoot)
+        if (explicitConfig != null) {
+            logger.info("Using explicit kmp-lsp.json configuration")
+            return explicitConfig.toKmpProject(projectRoot)
+        }
+
+        // Priority 2: Gradle auto-detection
         if (!isGradleProject(projectRoot)) {
-            logger.warn("Not a Gradle project: $projectRoot")
-            return null
+            logger.warn("Not a Gradle project and no kmp-lsp.json found: $projectRoot")
+            return fallbackManualImport(projectRoot)
         }
 
         logger.info("Importing Gradle project from: $projectRoot")

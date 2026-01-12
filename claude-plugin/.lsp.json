@@ -1,0 +1,15 @@
+{
+  "kotlin": {
+    "command": "/Users/jivie/kotlin-lsp2/build/install/kmp-lsp/bin/kmp-lsp",
+    "args": [],
+    "extensionToLanguage": {
+      ".kt": "kotlin",
+      ".kts": "kotlin"
+    },
+    "transport": "stdio",
+    "restartOnCrash": true,
+    "maxRestarts": 3,
+    "startupTimeout": 30000,
+    "shutdownTimeout": 5000
+  }
+}

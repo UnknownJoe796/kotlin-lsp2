@@ -1,0 +1,6 @@
+{
+  "name": "kotlin-lsp",
+  "version": "1.0.0",
+  "description": "Kotlin Multiplatform Language Server - provides completion, hover, go-to-definition, find references, rename, code actions, formatting, and semantic tokens for Kotlin files",
+  "author": "local"
+}
