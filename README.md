@@ -2,7 +2,7 @@
 
 A Language Server Protocol (LSP) implementation for Kotlin, with first-class support for Kotlin Multiplatform (KMP) projects.
 
-**Note:** This entire project was vibe-coded and could be a complete lie.  Everything below here is written by AI and should be trusted about as far as it could be thrown until I can spend some time testing it myself.
+**Note:** This entire project was vibe-coded and could be a complete lie.  Everything below here is written by AI and should be trusted about as far as it could be thrown until I can spend some time testing it myself.  For example, it certainly has unit tests and as you can see at the bottom, Claude lied against its own interest which is weird as hell.
 
 ## Features
 
