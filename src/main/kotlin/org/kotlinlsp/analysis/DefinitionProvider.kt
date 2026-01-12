@@ -138,8 +138,7 @@ class DefinitionProvider(private val analysisSession: AnalysisSession) {
     /**
      * Find all actual implementations for an expect declaration.
      *
-     * The Analysis API provides getExpectsForActual() but not the reverse.
-     * This implementation searches project source files for matching actual declarations.
+     * Uses the ExpectActualIndex for O(1) lookup instead of scanning all files.
      */
     @OptIn(KaExperimentalApi::class)
     private fun KaSession.findActualsForExpect(declaration: KtNamedDeclaration): List<Location> {
@@ -157,46 +156,65 @@ class DefinitionProvider(private val analysisSession: AnalysisSession) {
             return emptyList()
         }
 
+        // Use the index for fast lookup
+        val index = analysisSession.getExpectActualIndex()
+        val actualEntries = index.getActualsFor(expectName)
+
+        if (actualEntries.isEmpty()) {
+            logger.debug("No actuals found in index for expect: $expectName")
+            return emptyList()
+        }
+
         val locations = mutableListOf<Location>()
 
-        // Search through project modules for matching actual declarations
-        val project = analysisSession.getKmpProject() ?: return emptyList()
+        for (entry in actualEntries) {
+            try {
+                // Get the file content (may need to read from disk if not open)
+                val content = analysisSession.getDocumentContent(entry.fileUri)
+                    ?: java.io.File(java.net.URI(entry.fileUri)).readText()
 
-        for (module in project.modules) {
-            // Skip common module (where expects are defined)
-            if (module.name.contains("common", ignoreCase = true)) continue
+                analysisSession.updateDocument(entry.fileUri, content)
+                val ktFile = analysisSession.getKtFile(entry.fileUri) ?: continue
 
-            for (sourceRoot in module.sourceRoots) {
-                val sourceDir = sourceRoot.toFile()
-                if (!sourceDir.exists()) continue
+                // Find the actual declaration at the indexed offset
+                val element = ktFile.findElementAt(entry.offset)
+                val actualDecl = element?.let { findContainingDeclaration(it) } as? KtNamedDeclaration
+                    ?: continue
 
-                // Search for Kotlin files containing potential actuals
-                sourceDir.walkTopDown()
-                    .filter { it.extension == "kt" }
-                    .forEach { file ->
-                        try {
-                            val content = file.readText()
-                            // Quick text check for actual keyword and declaration name
-                            if (content.contains("actual") && content.contains(expectName)) {
-                                val uri = file.toURI().toString()
-                                // Update document and analyze
-                                analysisSession.updateDocument(uri, content)
-                                val ktFile = analysisSession.getKtFile(uri)
-                                if (ktFile != null) {
-                                    findActualInFile(ktFile, expectName, expectSymbol)?.let {
-                                        locations.add(it)
-                                    }
-                                }
-                            }
-                        } catch (e: Exception) {
-                            logger.debug("Error searching file ${file.path}: ${e.message}")
-                        }
+                if (actualDecl.name == expectName && actualDecl.hasModifier(KtTokens.ACTUAL_KEYWORD)) {
+                    // Verify it matches our expect (by kind)
+                    val matchesKind = when {
+                        declaration is KtNamedFunction && actualDecl is KtNamedFunction -> true
+                        declaration is KtProperty && actualDecl is KtProperty -> true
+                        declaration is KtClass && actualDecl is KtClass -> true
+                        else -> false
                     }
+
+                    if (matchesKind) {
+                        locations.add(createLocation(entry.fileUri, actualDecl))
+                    }
+                }
+            } catch (e: Exception) {
+                logger.debug("Error looking up actual from index: ${e.message}")
             }
         }
 
-        logger.debug("Found ${locations.size} actual implementations for expect: $expectName")
+        logger.debug("Found ${locations.size} actual implementations for expect: $expectName (via index)")
         return locations
+    }
+
+    /**
+     * Find the containing named declaration for an element.
+     */
+    private fun findContainingDeclaration(element: com.intellij.psi.PsiElement): KtNamedDeclaration? {
+        var current: com.intellij.psi.PsiElement? = element
+        while (current != null) {
+            if (current is KtNamedDeclaration) {
+                return current
+            }
+            current = current.parent
+        }
+        return null
     }
 
     /**

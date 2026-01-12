@@ -18,15 +18,27 @@ import org.jetbrains.kotlin.platform.js.JsPlatforms
 import org.jetbrains.kotlin.platform.konan.NativePlatforms
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtPsiFactory
+import org.kotlinlsp.index.DeclarationKind
+import org.kotlinlsp.index.ExpectActualEntry
+import org.kotlinlsp.index.ExpectActualIndex
 import org.kotlinlsp.project.KmpModule
 import org.kotlinlsp.project.KmpPlatform
 import org.kotlinlsp.project.KmpProject
+import org.jetbrains.kotlin.lexer.KtTokens
+import org.jetbrains.kotlin.psi.KtClass
+import org.jetbrains.kotlin.psi.KtModifierListOwner
+import org.jetbrains.kotlin.psi.KtNamedDeclaration
+import org.jetbrains.kotlin.psi.KtNamedFunction
+import org.jetbrains.kotlin.psi.KtProperty
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.net.URI
+import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Manages Kotlin Analysis API sessions for LSP operations.
@@ -58,6 +70,18 @@ class AnalysisSession {
 
     // Project reference
     private var kmpProject: KmpProject? = null
+
+    // Expect/actual index for fast navigation
+    private val expectActualIndex = ExpectActualIndex()
+
+    // Track if session needs rebuild (files changed on disk)
+    private val sessionDirty = AtomicBoolean(false)
+    private val lastRebuildTime = AtomicLong(System.currentTimeMillis())
+    private val pendingWrites = ConcurrentHashMap<String, Long>() // URI -> timestamp of last edit
+
+    // Debounce settings
+    private val writeDebounceMs = 500L  // Wait 500ms after last edit before writing
+    private val rebuildDebounceMs = 2000L  // Wait 2s of inactivity before rebuilding
 
     /**
      * Initialize the analysis session for a workspace.
@@ -112,9 +136,103 @@ class AnalysisSession {
 
             logger.info("Analysis API session created successfully")
 
+            // Build expect/actual index
+            buildExpectActualIndex()
+
         } catch (e: Exception) {
             logger.error("Failed to create Analysis API session: ${e.message}", e)
             throw e
+        }
+    }
+
+    /**
+     * Build the expect/actual index by scanning all source files.
+     */
+    private fun buildExpectActualIndex() {
+        expectActualIndex.clear()
+
+        val project = kmpProject
+        if (project != null) {
+            for (module in project.modules) {
+                for (sourceRoot in module.sourceRoots) {
+                    val sourceDir = sourceRoot.toFile()
+                    if (!sourceDir.exists()) continue
+
+                    sourceDir.walkTopDown()
+                        .filter { it.extension == "kt" }
+                        .forEach { file ->
+                            indexExpectActualsInFile(file)
+                        }
+                }
+            }
+        } else {
+            // Single-file mode: scan workspace
+            val workspace = workspaceRoot?.toFile() ?: return
+            findSourceRoots(workspaceRoot!!).forEach { sourceRoot ->
+                sourceRoot.toFile().walkTopDown()
+                    .filter { it.extension == "kt" }
+                    .forEach { file ->
+                        indexExpectActualsInFile(file)
+                    }
+            }
+        }
+
+        logger.info(expectActualIndex.stats())
+    }
+
+    /**
+     * Index expect/actual declarations in a single file.
+     */
+    private fun indexExpectActualsInFile(file: File) {
+        try {
+            val content = file.readText()
+
+            // Quick check - skip files without expect/actual keywords
+            if (!content.contains("expect ") && !content.contains("actual ")) {
+                return
+            }
+
+            val uri = file.toURI().toString()
+            val session = analysisSession ?: return
+
+            val ktFile = KtPsiFactory(session.project).createFile(file.name, content)
+
+            ktFile.declarations.forEach { decl ->
+                if (decl is KtModifierListOwner && decl is KtNamedDeclaration) {
+                    val name = decl.name ?: return@forEach
+
+                    val kind = when (decl) {
+                        is KtNamedFunction -> DeclarationKind.FUNCTION
+                        is KtProperty -> DeclarationKind.PROPERTY
+                        is KtClass -> DeclarationKind.CLASS
+                        else -> return@forEach
+                    }
+
+                    val signature = when (decl) {
+                        is KtNamedFunction -> decl.valueParameters.joinToString(",") { it.name ?: "_" }
+                        else -> null
+                    }
+
+                    val entry = ExpectActualEntry(
+                        name = name,
+                        kind = kind,
+                        fileUri = uri,
+                        offset = decl.textOffset,
+                        signature = signature
+                    )
+
+                    if (decl.hasModifier(KtTokens.EXPECT_KEYWORD)) {
+                        expectActualIndex.addExpect(entry)
+                    }
+                    if (decl.hasModifier(KtTokens.ACTUAL_KEYWORD)) {
+                        expectActualIndex.addActual(entry)
+                    }
+                }
+            }
+
+            expectActualIndex.markFileIndexed(uri)
+        } catch (e: Exception) {
+            logger.debug("Error indexing file ${file.path}: ${e.message}")
         }
     }
 
@@ -262,12 +380,92 @@ class AnalysisSession {
     }
 
     /**
-     * Update document content and invalidate caches.
+     * Update document content, write to disk, and invalidate caches.
+     *
+     * Writing to disk ensures the file is properly registered with the Analysis API
+     * session when we rebuild. The session discovers files from source roots, so
+     * files must exist on disk with current content.
      */
     fun updateDocument(uri: String, content: String) {
         documentContents[uri] = content
         ktFileCache.remove(uri)
-        logger.debug("Document updated: $uri (${content.length} chars)")
+
+        // Track this as a pending write
+        pendingWrites[uri] = System.currentTimeMillis()
+
+        // Update expect/actual index for this file
+        updateExpectActualIndexForContent(uri, content)
+
+        // Write to disk if the file exists in a source root
+        val path = uriToPath(uri)
+        if (path != null && Files.exists(path)) {
+            try {
+                Files.writeString(path, content)
+                sessionDirty.set(true)
+                logger.debug("Document updated and written to disk: $uri")
+            } catch (e: Exception) {
+                logger.warn("Failed to write document to disk: $uri - ${e.message}")
+            }
+        } else {
+            logger.debug("Document updated (not on disk): $uri")
+        }
+    }
+
+    /**
+     * Update the expect/actual index for a file's content.
+     */
+    private fun updateExpectActualIndexForContent(uri: String, content: String) {
+        // Remove old entries for this file
+        expectActualIndex.removeEntriesForFile(uri)
+
+        // Quick check - skip if no expect/actual
+        if (!content.contains("expect ") && !content.contains("actual ")) {
+            return
+        }
+
+        val session = analysisSession ?: return
+        val fileName = uri.substringAfterLast("/")
+
+        try {
+            val ktFile = KtPsiFactory(session.project).createFile(fileName, content)
+
+            ktFile.declarations.forEach { decl ->
+                if (decl is KtModifierListOwner && decl is KtNamedDeclaration) {
+                    val name = decl.name ?: return@forEach
+
+                    val kind = when (decl) {
+                        is KtNamedFunction -> DeclarationKind.FUNCTION
+                        is KtProperty -> DeclarationKind.PROPERTY
+                        is KtClass -> DeclarationKind.CLASS
+                        else -> return@forEach
+                    }
+
+                    val signature = when (decl) {
+                        is KtNamedFunction -> decl.valueParameters.joinToString(",") { it.name ?: "_" }
+                        else -> null
+                    }
+
+                    val entry = ExpectActualEntry(
+                        name = name,
+                        kind = kind,
+                        fileUri = uri,
+                        offset = decl.textOffset,
+                        signature = signature
+                    )
+
+                    if (decl.hasModifier(KtTokens.EXPECT_KEYWORD)) {
+                        expectActualIndex.addExpect(entry)
+                    }
+                    if (decl.hasModifier(KtTokens.ACTUAL_KEYWORD)) {
+                        expectActualIndex.addActual(entry)
+                    }
+                }
+            }
+
+            expectActualIndex.markFileIndexed(uri)
+        } catch (e: Exception) {
+            logger.debug("Error updating expect/actual index for $uri: ${e.message}")
+        }
     }
 
     /**
@@ -276,6 +474,7 @@ class AnalysisSession {
     fun closeDocument(uri: String) {
         documentContents.remove(uri)
         ktFileCache.remove(uri)
+        pendingWrites.remove(uri)
         logger.debug("Document closed: $uri")
     }
 
@@ -286,21 +485,92 @@ class AnalysisSession {
 
     /**
      * Get or create a KtFile for the given URI.
+     *
+     * Strategy:
+     * 1. Check if session needs rebuild (files written to disk)
+     * 2. Try to find KtFile from session's discovered files (has module context)
+     * 3. Fall back to KtPsiFactory for files outside source roots (no module context)
      */
     fun getKtFile(uri: String): KtFile? {
+        // Check if we need to rebuild the session
+        maybeRebuildSession()
+
+        // Check cache first
         ktFileCache[uri]?.let { return it }
 
         val content = documentContents[uri] ?: return null
         val session = analysisSession ?: return null
+        val path = uriToPath(uri)
 
+        // Strategy 1: Find in session's discovered files (has proper module context)
+        if (path != null) {
+            val pathStr = path.toString()
+            val discoveredFile = session.modulesWithFiles
+                .flatMap { it.value }
+                .filterIsInstance<KtFile>()
+                .find { ktFile ->
+                    ktFile.virtualFile?.path == pathStr ||
+                    ktFile.virtualFile?.path?.endsWith(path.fileName.toString()) == true &&
+                    ktFile.virtualFile?.path?.contains(path.parent?.fileName?.toString() ?: "") == true
+                }
+
+            if (discoveredFile != null) {
+                ktFileCache[uri] = discoveredFile
+                logger.debug("Found KtFile in session (with module context): $uri")
+                return discoveredFile
+            }
+        }
+
+        // Strategy 2: Fall back to KtPsiFactory (no module context, but works for any file)
         val fileName = uri.substringAfterLast("/")
-
-        // Create KtFile using the Analysis API project
         val ktFile = KtPsiFactory(session.project).createFile(fileName, content)
         ktFileCache[uri] = ktFile
 
-        logger.debug("Created KtFile for: $uri")
+        logger.debug("Created detached KtFile (no module context): $uri")
         return ktFile
+    }
+
+    /**
+     * Rebuild the session if files have been modified and enough time has passed.
+     */
+    private fun maybeRebuildSession() {
+        if (!sessionDirty.get()) return
+
+        val now = System.currentTimeMillis()
+        val lastEdit = pendingWrites.values.maxOrNull() ?: 0L
+        val timeSinceLastEdit = now - lastEdit
+        val timeSinceLastRebuild = now - lastRebuildTime.get()
+
+        // Only rebuild if:
+        // 1. Session is dirty
+        // 2. At least rebuildDebounceMs since last edit (user stopped typing)
+        // 3. At least rebuildDebounceMs since last rebuild (don't rebuild too often)
+        if (timeSinceLastEdit >= rebuildDebounceMs && timeSinceLastRebuild >= rebuildDebounceMs) {
+            logger.info("Rebuilding Analysis API session (files changed on disk)")
+            try {
+                createAnalysisSession()
+                sessionDirty.set(false)
+                pendingWrites.clear()
+                lastRebuildTime.set(now)
+            } catch (e: Exception) {
+                logger.error("Failed to rebuild session: ${e.message}", e)
+            }
+        }
+    }
+
+    /**
+     * Convert URI to Path.
+     */
+    private fun uriToPath(uri: String): Path? {
+        return try {
+            Paths.get(URI(uri))
+        } catch (e: Exception) {
+            try {
+                Paths.get(uri.removePrefix("file://"))
+            } catch (e2: Exception) {
+                null
+            }
+        }
     }
 
     /**
@@ -384,11 +654,34 @@ class AnalysisSession {
     fun getKmpProject(): KmpProject? = kmpProject
 
     /**
+     * Get the expect/actual index for fast navigation.
+     */
+    fun getExpectActualIndex(): ExpectActualIndex = expectActualIndex
+
+    /**
      * Invalidate all caches to force re-analysis.
      */
     fun invalidateSession() {
         ktFileCache.clear()
-        logger.debug("Session cache cleared")
+        sessionDirty.set(true)
+        logger.debug("Session cache cleared, marked for rebuild")
+    }
+
+    /**
+     * Force an immediate session rebuild.
+     * Call this when you know files have changed significantly (e.g., user saved).
+     */
+    fun forceRebuild() {
+        logger.info("Forcing Analysis API session rebuild")
+        ktFileCache.clear()
+        pendingWrites.clear()
+        try {
+            createAnalysisSession()
+            sessionDirty.set(false)
+            lastRebuildTime.set(System.currentTimeMillis())
+        } catch (e: Exception) {
+            logger.error("Failed to force rebuild session: ${e.message}", e)
+        }
     }
 
     /**
@@ -398,6 +691,8 @@ class AnalysisSession {
         ktFileCache.clear()
         documentContents.clear()
         moduleCache.clear()
+        pendingWrites.clear()
+        sessionDirty.set(false)
 
         disposable?.let {
             Disposer.dispose(it)

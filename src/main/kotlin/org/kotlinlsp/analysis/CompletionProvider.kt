@@ -7,6 +7,7 @@ import org.eclipse.lsp4j.InsertTextFormat
 import org.eclipse.lsp4j.MarkupContent
 import org.eclipse.lsp4j.Position
 import org.eclipse.lsp4j.jsonrpc.messages.Either
+import org.jetbrains.kotlin.analysis.api.KaExperimentalApi
 import org.jetbrains.kotlin.analysis.api.KaSession
 import org.jetbrains.kotlin.analysis.api.symbols.*
 import org.jetbrains.kotlin.analysis.api.types.KaType
@@ -41,8 +42,10 @@ class CompletionProvider(private val analysisSession: AnalysisSession) {
 
     /**
      * Get completions using Analysis API with proper scope-based resolution.
-     * Uses scopeContext to get all visible symbols at the cursor position.
+     * Uses scopeContext to get all visible symbols at the cursor position,
+     * including members from implicit receivers (extension functions, with/apply blocks).
      */
+    @OptIn(KaExperimentalApi::class)
     private fun getAnalysisApiCompletions(ktFile: KtFile, position: Position): List<CompletionItem> {
         val completions = mutableListOf<CompletionItem>()
 
@@ -67,8 +70,9 @@ class CompletionProvider(private val analysisSession: AnalysisSession) {
                     }
                 }
 
-                // Note: Implicit receivers (for extension function context) are handled
-                // through the scope tower already. Type scope API is experimental.
+                // Add members from implicit receivers (extension functions, with/apply blocks)
+                // This allows completions like `length` inside `fun String.myExt() { }`
+                addImplicitReceiverCompletions(scopeContext, completions)
 
             } catch (e: Exception) {
                 logger.warn("Error getting scope-based completions: ${e.message}", e)
@@ -79,6 +83,40 @@ class CompletionProvider(private val analysisSession: AnalysisSession) {
         }
 
         return completions
+    }
+
+    /**
+     * Add completions from implicit receivers (extension function receivers, with/apply receivers).
+     */
+    @OptIn(KaExperimentalApi::class)
+    private fun KaSession.addImplicitReceiverCompletions(
+        scopeContext: org.jetbrains.kotlin.analysis.api.components.KaScopeContext,
+        completions: MutableList<CompletionItem>
+    ) {
+        for (implicitReceiver in scopeContext.implicitReceivers) {
+            val receiverType = implicitReceiver.type
+            val typeLabel = renderType(receiverType)
+
+            try {
+                // Get the class symbol for the receiver type to access its members
+                val classSymbol = receiverType.expandedSymbol
+                if (classSymbol != null) {
+                    // Get member scope of the class
+                    val memberScope = classSymbol.memberScope
+
+                    // Add all declarations from the member scope
+                    for (symbol in memberScope.declarations) {
+                        createCompletionFromSymbol(symbol)?.let { item ->
+                            // Mark as coming from implicit receiver for better UX
+                            item.detail = "${item.detail ?: ""} (from $typeLabel)".trim()
+                            completions.add(item)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                logger.debug("Error getting implicit receiver completions for $typeLabel: ${e.message}")
+            }
+        }
     }
 
     /**

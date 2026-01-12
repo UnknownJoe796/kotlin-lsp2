@@ -70,6 +70,9 @@ class KmpTextDocumentService(
         val uri = params.textDocument.uri
         logger.info("Document saved: $uri")
 
+        // Force session rebuild on save to ensure full module context
+        analysisSession.forceRebuild()
+
         // Re-analyze on save
         publishDiagnostics(uri)
     }
